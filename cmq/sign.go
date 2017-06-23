@@ -4,12 +4,18 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io/ioutil"
 	"math/rand"
+	"net/http"
 	"net/url"
 	"sort"
 	"strconv"
 	"time"
+
+	"github.com/bitly/go-simplejson"
+	"github.com/golang/glog"
 )
 
 type Cmq struct {
@@ -77,11 +83,117 @@ func (c *Cmq) GenSignString(method, action string, params map[string]string) {
 	} else {
 		orignal = method + c.OutterAddr + CLOUD_API_URI + "?" + orignal[:len(orignal)-1]
 	}
-	l, _ := url.Parse("http://www.baidu.com?" + base64.StdEncoding.EncodeToString([]byte(Hmac_Sha1(orignal, c.SecretKey))))
-	c.Sign = l.Query().Encode()
+	c.Sign = base64.StdEncoding.EncodeToString([]byte(Hmac_Sha1(orignal, c.SecretKey)))
 }
 
-// @Description
+func (c *Cmq) commonParams() url.Values {
+	params := url.Values{}
+	params.Add("Action", c.Action)
+	params.Add("Region", c.Region)
+	params.Add("Timestamp", fmt.Sprint(c.TimeStamp))
+	params.Add("Nonce", c.Nonce)
+	params.Add("SecretId", c.SecretId)
+	params.Add("Signature", c.Sign)
+	return params
+}
+
+func (c *Cmq) getUrl() string {
+	addr := ""
+	if c.IsInner {
+		addr = "http://" + c.InnerAddr
+	} else {
+		addr = "https://" + c.OutterAddr
+	}
+	return addr + CLOUD_API_URI
+}
+
+func (c *Cmq) sendRequest(action string, specificParams map[string]string) ([]byte, error) {
+	c.GenSignString("POST", action, specificParams)
+	params := c.commonParams()
+	for key, value := range specificParams {
+		params.Add(key, value)
+	}
+	resp, err := http.PostForm(c.getUrl(), params)
+	if err != nil {
+		glog.Infoln(err.Error())
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	bys, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		glog.Infoln("%v", err)
+		return nil, err
+	}
+	return bys, nil
+}
+
+func (c *Cmq) CreateQueue(queueName string) {
+	if _, err := c.sendRequest("CreateQueue", map[string]string{
+		"queueName": queueName,
+	}); err != nil {
+		glog.Infoln(err)
+	}
+}
+
+func (c *Cmq) DeleteQueue(queueName string) {
+	if _, err := c.sendRequest("DeleteQueue", map[string]string{
+		"queueName": queueName,
+	}); err != nil {
+		glog.Infoln(err)
+	}
+}
+
+func (c *Cmq) SendMessage(queueName string, msgBody string) error {
+	var i int
+	for i = 3; i > 0; i-- {
+		bys, err := c.sendRequest("SendMessage", map[string]string{
+			"queueName": queueName,
+			"msgBody":   msgBody,
+		})
+		glog.Infoln(string(bys))
+		if result, jsonErr := simplejson.NewJson(bys); jsonErr == nil {
+			if code, jsonErr := result.Get("code").Int(); jsonErr == nil {
+				if code == 0 {
+					return err
+				} else {
+					glog.Infoln("Error to send message!!!")
+				}
+			}
+		}
+	}
+	return errors.New("send error")
+}
+
+func (c *Cmq) BatchSendMessage(queueName string, msgBodys []string) {
+	params := map[string]string{}
+	for index, msgBody := range msgBodys {
+		params["msgBody."+strconv.Itoa(index+1)] = msgBody
+	}
+	params["queueName"] = queueName
+	if _, err := c.sendRequest("BatchSendMessage", params); err != nil {
+		glog.Infoln(err)
+	}
+}
+
+func (c *Cmq) BatchReceiveMessage(queueName string, msgNum int) ([]byte, error) {
+	return c.sendRequest("BatchReceiveMessage", map[string]string{
+		"queueName": queueName,
+		"numOfMsg":  strconv.Itoa(msgNum),
+	})
+}
+
+func (c *Cmq) BatchDeleteMessage(queueName string, receiptHandles []string) {
+	params := map[string]string{}
+	for index, receiptHandle := range receiptHandles {
+		params["receiptHandle."+strconv.Itoa(index+1)] = receiptHandle
+	}
+	params["queueName"] = queueName
+	if _, err := c.sendRequest("BatchDeleteMessage", params); err != nil {
+		glog.Infoln(err)
+	}
+}
+
 func Hmac_Sha1(data, key string) string {
 	mac := hmac.New(sha1.New, []byte(key))
 	mac.Write([]byte(data))
